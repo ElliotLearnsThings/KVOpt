@@ -1,4 +1,4 @@
-use std::{io::{self, Read}, sync::Arc};
+use std::{io::{self, Read, Write}, sync::Arc};
 
 use crate::Cache;
 
@@ -23,41 +23,45 @@ impl<'a> BufferAccess<'a> for Cache {
         let should_exit = Arc::clone(&self.should_exit);
         let handle = std::thread::spawn(move || {
             let command = input[0];
-            println!("{}", command);
             let key: [u8; 63] = input[1..64].try_into().expect("Slice length must be 63");
-            let veckey = &key.to_vec();
-            let keystr = std::str::from_utf8(&veckey).unwrap();
-            println!("{}", keystr);
             let value: [u8; 64] = input[64..128].try_into().expect("Slice length must be 64"); 
-            let vecvalue = &value.to_vec(); 
-            let valuestr = std::str::from_utf8(&vecvalue).unwrap();
-            println!("{}", valuestr);
 
             match command {
                 b'G' => {
                     let kv = vals.lock().expect("Unable to lock KV in thread");
                     if let Some(out) = kv.get(&key) {
-                        println!("{:?}", out);
+                        let stdout = io::stdout();
+                        let mut handle = stdout.lock();
+                        handle.write_all(out).unwrap();
+                        handle.write(b"\n").unwrap();
+                        handle.flush().unwrap();
+                    } else {
+                        let stdout = io::stdout();
+                        let mut handle = stdout.lock();
+                        handle.write_all(b"G\n").unwrap();
+                        handle.flush().unwrap();
                     };
                     return
                 },
 
                 b'R' => {
                     let mut kv = vals.lock().expect("Unable to lock KV in thread");
-                    if let Some(out) = kv.remove(&key) {
-                        println!("{:?}", out);
-                    };
-                    return
+                    let _ = kv.remove(&key);
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
+                    handle.write_all(b"R\n").unwrap();
+                    handle.flush().unwrap();
                 }
                 
                 b'I' => {
                     let mut kv = vals.lock().expect("Unable to lock KV in thread");
-                    if let Some(out) = kv.insert(key, value) {
-                        println!("{:?}", out);
-                    } else {
-                        return
-                    }
+                    let _ = kv.insert(key, value);
+                    let stdout = io::stdout();
+                    let mut handle = stdout.lock();
+                    handle.write_all(b"I\n").unwrap();
+                    handle.flush().unwrap();
                 }
+
                 b'H' => {
                     let mut should_exit = should_exit.lock().expect("Unable to lock should_exit");
                     *should_exit = true;

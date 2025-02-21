@@ -3,6 +3,7 @@ use std::{fmt::Display, path::{Path, PathBuf}, sync::{Arc, Mutex}};
 
 use crate::Cache;
 
+#[derive(Clone)]
 pub struct Logger {
     pub log_path: Arc<Mutex<PathBuf>>,
     out: bool,
