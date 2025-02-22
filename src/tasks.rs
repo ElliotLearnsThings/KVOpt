@@ -13,7 +13,7 @@ pub fn run_tasks(cache: Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Resul
     let cache_for_tasks = Arc::clone(&cache);
     // Clone cache for tasks_thread
     let tasks_thread = thread::spawn(move || {
-        println!("Tasks thread started");
+        //println!("Tasks thread started");
         loop {
             let cv_inner = Arc::clone(&cv_for_tasks);
             let cache_for_tasks = Arc::clone(&cache_for_tasks);
@@ -23,14 +23,17 @@ pub fn run_tasks(cache: Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Resul
                 let cache = cache_for_tasks.lock().expect("Unable to lock cache");
                 let kv = &cache.vals;
 
-                println!("Ran thread tasks");
+                //println!("Ran thread tasks");
+                //if *cache.should_exit.lock().unwrap() {
+                    //exit(0);
+                //}
 
                 let kv_guard = kv.lock().expect("Unable to lock kv");
                 invalidate_cache(kv_guard).expect("unable to lock");
                 return;
             });
             let _ = looped_thread.join();
-            thread::sleep(time::Duration::from_secs_f32(10.0));
+            thread::sleep(time::Duration::from_secs_f32(10000.0));
         }
     });
 
@@ -44,7 +47,7 @@ pub fn run_tasks(cache: Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Resul
 
         loop {
             if !duration.is_zero() {
-                println!("diff: {}", duration);
+                //println!("diff: {}", duration);
             }
             let stdin = io::stdin();
             let mut handle = stdin.lock();
@@ -72,10 +75,50 @@ pub fn run_tasks(cache: Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Resul
 }
 
 
-fn invalidate_cache(_kv: MutexGuard<HashMap<[u8; 63], [u8; 64]>>) -> Result<(), Box<dyn std::error::Error>> {
-    // not implemented
+fn invalidate_cache(mut kv: MutexGuard<HashMap<[u8; 63], [u8; 64]>>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut keys_to_remove: Vec<[u8;63]> = Vec::new();
+
+    for val in kv.iter_mut() {
+        let mut should_remove = false;
+        let key = val.0;
+
+        // Create start time buffer
+        let mut start_time: [u8; 8] = [0u8; 8];
+        start_time[2..].copy_from_slice(&val.1[56..62]);
+
+        let start_time = i64::from_be_bytes(start_time);
+        //println!("Got start_time: {}", start_time.clone());
+
+        // Create expire time buffer
+        let mut expire_time = [0u8;2]; // 56-64 are time values
+        expire_time[..].clone_from_slice(&val.1[62..64]);
+
+        let expire_time = i16::from_be_bytes(expire_time);
+        //println!("Got expire_time: {}", expire_time.clone());
+
+        // start time is epoch timestamp in secs
+        // therefore start_time + hours is expire_time timestamp
+        
+        let current_timestamp = chrono::Utc::now().timestamp();
+        let expire_timestamp = start_time + (expire_time as i64);
+
+        // If the expire is smaller than current
+        if current_timestamp > expire_timestamp {
+            should_remove = true;
+        }
+
+        // If should remove save key to vec
+        if should_remove {
+            keys_to_remove.push(*key);
+        }
+    }
+
+    // Remove collected items.
+    for item in keys_to_remove {
+        kv.remove(&item);
+    }
+
     Ok(())
-    
 }
 
 #[cfg(test)]
@@ -94,8 +137,19 @@ mod tests {
             let iuuid = uuid::Uuid::new_v4().to_string();
             let ibreak = "0".repeat(48);
             let fuuid = uuid::Uuid::new_v4().to_string();
-            let fbreak = "0".repeat(48);
-            let buffer = format!("{}{}{}{}{}", command, iuuid, ibreak, fuuid, fbreak);
+            let fbreak = "0".repeat(40);
+            let mut tcurb = [0u8;6];
+            let tcur = chrono::Utc::now().timestamp().to_be_bytes();
+            tcurb[..].copy_from_slice(&tcur[2..]);
+            let tlen = (10 as i16).to_be_bytes();
+            
+            let mut tbuf = [0u8;8];
+            tbuf[..6].copy_from_slice(&tcurb);
+            tbuf[6..8].copy_from_slice(&tlen);
+
+            let tbufstr = std::str::from_utf8(&tbuf).unwrap();
+
+            let buffer = format!("{}{}{}{}{}{}", command, iuuid, ibreak, fuuid, fbreak, tbufstr);
             let buffer = buffer.as_bytes();
             let len = buffer.len().min(128);
             let mut byte_array = [0u8;128];

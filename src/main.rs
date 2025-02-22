@@ -44,7 +44,7 @@ impl Cache {
 fn main() {
     let mut cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log");
     let mut time = format!("START AT SYSTEMTIME: {}", chrono::Utc::now());
-    let logger = Logger::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", true);
+    let logger = Logger::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", false);
     let _ = cache.write_log(&mut time);
     let _ = tasks::run_tasks(Arc::from(Mutex::from(cache)), Arc::from(Mutex::from(logger)));
 }

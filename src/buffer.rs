@@ -63,6 +63,7 @@ impl<'a> BufferAccess<'a> for Cache {
 
             b'H' => {
                 let mut should_exit = should_exit.lock().expect("Unable to lock should_exit");
+                println!("Exiting..");
                 *should_exit = true;
             }
             _ => {}, // Early return for unrecognized command
