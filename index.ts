@@ -141,21 +141,18 @@ class CacheProcess {
       }
     });
   }
-
   close(): void {
-    if (this.process) {
-      this.process.stdin.end();
-      this.process.kill();
-      if (this.level === "debug") {
-        console.log("Rust program closed.");
-      }
-    } else {
-      if (this.level === "debug") {
-        console.error("Rust program is not started.");
-      }
-    }
+    this.process?.kill();
   }
 }
 
 const rustProgramPath = cwd() + "/target/release/cacherebbok";
-export const RustCache = new CacheProcess(rustProgramPath, "normal");
+export const RustCache = new CacheProcess(rustProgramPath, "debug");
+
+RustCache.start();
+console.log(await RustCache.insert("Hello", "World!", 10));
+console.log(await RustCache.get("Hello"));
+RustCache.close();
+//RustCache.start();
+//console.log(await RustCache.get("Hello"));
+//RustCache.close();

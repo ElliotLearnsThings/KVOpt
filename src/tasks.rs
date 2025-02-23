@@ -6,11 +6,11 @@ use chrono::TimeDelta;
 use crate::{buffer::BufferAccess, logger::Logger, Cache};
 
 // run_tasks function
-pub fn run_tasks(cache: Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_tasks(cache: &Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Result<(), Box<dyn std::error::Error>> {
 
     let cv = Arc::new((Mutex::new(false), Condvar::new()));
     let cv_for_tasks = Arc::clone(&cv);
-    let cache_for_tasks = Arc::clone(&cache);
+    let cache_for_tasks = Arc::clone(cache);
     // Clone cache for tasks_thread
     let tasks_thread = thread::spawn(move || {
         //println!("Tasks thread started");

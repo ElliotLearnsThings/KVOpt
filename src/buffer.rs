@@ -20,7 +20,7 @@ impl<'a> BufferAccess<'a> for Cache {
 
         // Clone vals for thread-safe access
         let vals = Arc::clone(&self.vals);
-        let should_exit = Arc::clone(&self.should_exit);
+        //let should_exit = Arc::clone(&self.should_exit);
         let command = input[0];
         let key: [u8; 63] = input[1..64].try_into().expect("Slice length must be 63");
         let value: [u8; 64] = input[64..128].try_into().expect("Slice length must be 64"); 
@@ -62,9 +62,10 @@ impl<'a> BufferAccess<'a> for Cache {
             }
 
             b'H' => {
-                let mut should_exit = should_exit.lock().expect("Unable to lock should_exit");
-                println!("Exiting..");
-                *should_exit = true;
+                match self.clean_up(){
+                    Ok(v) => {v},
+                    Err(e) => {println!("An error occured in clean_up: {}", e.to_string());}
+                };
             }
             _ => {}, // Early return for unrecognized command
         };
