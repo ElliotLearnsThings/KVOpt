@@ -95,7 +95,11 @@ class CacheProcess {
           this.process.stdout.once("data", (data: Buffer) => {
             let outstr = data.slice(0, 56).toString();
             if (outstr === "G") {
-              throw new Error("No longer exists");
+              if (this.level === "debug") {
+                console.log("No longer exists");
+              } else {
+                throw new Error("No longer exists");
+              }
             }
             resolve(outstr.replace("\n", ""));
           });
@@ -142,17 +146,31 @@ class CacheProcess {
     });
   }
   close(): void {
-    this.process?.kill();
+    if (this.process) {
+      this.process.on("exit", (code) => {
+        console.log("Exit code:", code);
+      });
+      this.process.on("close", (code, signal) => {
+        console.log("Process closed with code:", code);
+        console.log("Termination signal:", signal); // SIGTERM or other signal
+      });
+      this.process.kill("SIGTERM");
+    }
   }
 }
 
-const rustProgramPath = cwd() + "/target/release/cacherebbok";
+const rustProgramPath = cwd() + "/target/release/cacherebbok.exe";
 export const RustCache = new CacheProcess(rustProgramPath, "debug");
+main();
 
-RustCache.start();
-console.log(await RustCache.insert("Hello", "World!", 10));
-console.log(await RustCache.get("Hello"));
-RustCache.close();
-//RustCache.start();
-//console.log(await RustCache.get("Hello"));
-//RustCache.close();
+async function main() {
+  RustCache.start();
+  console.log(await RustCache.insert("Hello", "World!", 10));
+  console.log(await RustCache.get("Hello"));
+  RustCache.close();
+  setTimeout(async () => {
+    RustCache.start();
+    console.log(await RustCache.get("Hello"));
+    RustCache.close();
+  }, 2000);
+}
