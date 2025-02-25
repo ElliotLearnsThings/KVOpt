@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::{self, Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex, RwLock}};
+use std::{io::{Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, Arc, Mutex, RwLock}};
 use chrono::{DateTime, TimeDelta, Utc};
 use dashmap::DashMap;
 use hashbrown;
@@ -169,7 +169,7 @@ impl Cache {
         
         // Process the data in chunks of 127 bytes (key+value)
         let mut vals = hashbrown::HashMap::with_capacity(bytes_read / 127);
-        let mut entries = DashMap::with_capacity(bytes_read / 127);
+        let entries = DashMap::with_capacity(bytes_read / 127);
         
         for chunk in buf.chunks_exact(127) {
             if chunk.len() == 127 {
