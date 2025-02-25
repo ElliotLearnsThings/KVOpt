@@ -1,195 +1,176 @@
-use std::{collections::HashMap, fmt::{self, Display}, io::{Read, Write}, path::Path, sync::{Arc, Mutex, MutexGuard}};
 
-use chrono::Utc;
+use std::{borrow::Cow, fs, io::{self, BufWriter, Write}, path::Path};
 
-use crate::{logger::Log, Cache, LogLevel};
+use chrono::{DateTime, TimeDelta, Utc};
 
-impl<T> Log<T> for Cache
-where
-    T: Display + fmt::Write + std::marker::Send + std::marker::Sync,
-{
-    // This will be on spawned thread
-    fn write_log(&mut self, input: T) -> Result<(), Box<dyn std::error::Error>> 
-        where T: std::fmt::Display + Send,
-    {
+use crate::CacheEntry;
 
-        let input_clone = input.to_string();
-        let cur_time = Utc::now();
+// Utility function to extract timestamp and expiration from cache value
+pub fn parse_cache_metadata(value: &[u8; 64]) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
+    // Get timestamp (6 bytes)
+    let mut timestamp_bytes = [0u8; 8];
+    timestamp_bytes[2..8].copy_from_slice(&value[56..62]);
+    let timestamp = i64::from_be_bytes(timestamp_bytes);
+    
+    // Get expiration (2 bytes)
+    let mut expiry_bytes = [0u8; 2];
+    expiry_bytes.copy_from_slice(&value[62..64]);
+    let expiry_seconds = u16::from_be_bytes(expiry_bytes);
+    
+    // Create DateTime objects
+    let created_at = DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .unwrap_or_else(|| Utc::now());
+    
+    let expires_at = if expiry_seconds > 0 {
+        Some(created_at + TimeDelta::try_seconds(expiry_seconds as i64).unwrap_or_default())
+    } else {
+        None
+    };
+    
+    (created_at, expires_at)
+}
 
-        let path_name = Arc::clone(&self.log_path);
-
-        let log_thread = std::thread::spawn({
-            move || {
-                let path = path_name.lock().unwrap();
-                let mut buf = std::fs::read(&*path).unwrap();
-                let log_entry = format!("\n\r[LOG @{}]{}", cur_time, input_clone);
-                buf.extend_from_slice(log_entry.as_bytes());
-                std::fs::write(&*path, &buf).unwrap();
-            }
-        });
-
-        log_thread.join().unwrap();
-        Ok(())
+// Utility function to create a cache entry from raw data
+pub fn create_cache_entry(value: &[u8; 64]) -> CacheEntry {
+    let mut value_only = [0u8; 56];
+    value_only.copy_from_slice(&value[0..56]);
+    
+    let (created_at, expires_at) = parse_cache_metadata(value);
+    
+    CacheEntry {
+        value: value_only,
+        created_at,
+        expires_at,
     }
 }
 
-impl Cache {
-    pub fn from_log_path(log_path: &str, level: LogLevel) -> Self {
-        let cur_buf = Arc::new(Mutex::new([0u8; 128]));
-        let path = Path::new(log_path);
-        let log_path = Arc::new(Mutex::new(path.to_path_buf()));
-        Cache {
-            cur_buf,
-            log_path,
-            vals: Arc::new(Mutex::new(HashMap::new())),
-            should_exit: Arc::new(Mutex::new(false)),
-            level,
+// Efficiently write a large buffer to a file
+pub fn write_buffer_to_file(path: &Path, buffer: &[u8]) -> io::Result<usize> {
+    // Ensure parent directory exists
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    
+    // Use BufWriter for efficient writing
+    let file = fs::File::create(path)?;
+    let mut writer = BufWriter::with_capacity(65536, file); // 64KB buffer
+    
+    let bytes_written = writer.write(buffer)?;
+    writer.flush()?;
+    
+    Ok(bytes_written)
+}
+
+// Efficiently read a file into a buffer
+pub fn read_file_to_buffer(path: &Path) -> io::Result<Vec<u8>> {
+    // Check if file exists first
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    
+    // Get file size for pre-allocation
+    let metadata = fs::metadata(path)?;
+    let file_size = metadata.len() as usize;
+    
+    // Pre-allocate buffer
+    let mut buffer = Vec::with_capacity(file_size);
+    let file = fs::File::open(path)?;
+    
+    // Use Read trait to fill buffer
+    io::Read::read_to_end(&mut io::BufReader::new(file), &mut buffer)?;
+    
+    Ok(buffer)
+}
+
+// Convert raw bytes to a string, handling non-UTF8 data safely
+pub fn bytes_to_string(bytes: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
+}
+
+// Helper function to get current timestamp in seconds since epoch
+pub fn current_timestamp() -> i64 {
+    Utc::now().timestamp()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::NamedTempFile;
+    
+    #[test]
+    fn test_parse_cache_metadata() {
+        // Create a test value with known timestamp and expiration
+        let mut value = [0u8; 64];
+        
+        // Set timestamp to a known value (2023-01-01 00:00:00 UTC = 1672531200)
+        let timestamp = 1672531200i64;
+        let timestamp_bytes = timestamp.to_be_bytes();
+        value[56..62].copy_from_slice(&timestamp_bytes[2..8]);
+        
+        // Set expiration to 3600 seconds (1 hour)
+        let expiry = 3600u16;
+        let expiry_bytes = expiry.to_be_bytes();
+        value[62..64].copy_from_slice(&expiry_bytes);
+        
+        // Parse metadata
+        let (created_at, expires_at) = parse_cache_metadata(&value);
+        
+        // Check created_at
+        assert_eq!(created_at.timestamp(), timestamp);
+        
+        // Check expires_at
+        assert!(expires_at.is_some());
+        if let Some(expires) = expires_at {
+            assert_eq!(expires.timestamp(), timestamp + expiry as i64);
         }
     }
-    pub fn log_debug(&mut self, log: String) {
-        match self.level { LogLevel::DEBUG => {let _ = self.write_log(log);}, _ => {}, };
+    
+    #[test]
+    fn test_create_cache_entry() {
+        // Create a test value
+        let mut value = [0u8; 64];
+        
+        // Set some data in the value portion
+        value[0..5].copy_from_slice(b"hello");
+        
+        // Set timestamp and expiration
+        let timestamp = Utc::now().timestamp();
+        let timestamp_bytes = timestamp.to_be_bytes();
+        value[56..62].copy_from_slice(&timestamp_bytes[2..8]);
+        
+        let expiry = 3600u16;
+        let expiry_bytes = expiry.to_be_bytes();
+        value[62..64].copy_from_slice(&expiry_bytes);
+        
+        // Create cache entry
+        let entry = create_cache_entry(&value);
+        
+        // Check value portion
+        assert_eq!(&entry.value[0..5], b"hello");
+        
+        // Check metadata
+        assert!(entry.expires_at.is_some());
     }
-    pub fn load(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Read from json in file to get cache state.
-
-        self.log_debug("OPENING CACHE (on load) STORE".to_owned());
-        let mut file = std::fs::File::open(std::env::current_dir()?.join("data/cache.json"))?;
-
-        self.log_debug("Initializing buffer as an empty vector.".to_owned());        
-        let mut buf = Vec::new();
-
-        self.log_debug("Attempting to read from file into buffer.".to_owned());
-        let bytes_read = file.read_to_end(&mut buf)?;
-        self.log_debug(format!("Bytes read: {}", bytes_read));
-
-        if buf.is_empty() {
-            self.log_debug("Buffer is empty after read operation.".to_owned());
-        } else {
-            self.log_debug(format!("Buffer contains data: {:?}", buf));
-        }
-
-        // For every line in the file, add key then value
-        self.log_debug("Handling read lines from buffer and storing in self.vals.".to_owned());
-        self.vals = Arc::from(Mutex::from(self.handle_read_lines(buf)));
-        self.log_debug("Contents successfully stored in self.vals.".to_owned());
-        Ok(())
-    }
-    pub fn clean_up(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-
-        let _ = self.write_log("OPENING CACHE (on exit) STORE".to_owned());
-        let kv = self.vals.lock().unwrap();
-
-        let len = kv.len();
-        let writable_bytes = self.clone().create_byte_lines(kv);
-
-
-        let _ = self.log_debug(format!("NO. OBJECTS TO STORE {}", len));
-
-        self.log_debug(format!("ATTEMPT AMOUNT OF BYTES TO WRITE: {}", writable_bytes.len()));
-
-        let mut file = std::fs::File::create(std::env::current_dir()?.join("data/cache.json"))?;
-        let amount = file.write(&writable_bytes)?;
-
-        self.log_debug(format!("AMOUNT OF BYTES WRITTEN: {}", amount));
-
-        // save state to json in file (twice).
-        Ok(())
-    }
-    pub fn handle_save (&mut self) {
-        self.log_debug(format!("ATTEMPTING SAVE AT: {}", chrono::Utc::now()));
-        self.clean_up().expect("Unable to clean up cache");
-        self.log_debug(format!("SAVE AT: {}", chrono::Utc::now()));
-    }
-    pub fn create_byte_lines(&mut self, kv: MutexGuard<HashMap<[u8; 63], [u8; 64]>>) -> Vec<u8> {
-
-        let mut bytes: Vec<u8> = Vec::new();
-
-        self.log_debug("HANDLING BYTE LINES: Start processing byte lines.".to_owned());
-
-        for (key, value) in kv.iter() {
-            self.log_debug(format!("Processing key: {:?}", key));
-            for val in key {
-                bytes.push(val.clone());
-            }
-            self.log_debug(format!("Processed key: {:?}", key));
-            self.log_debug(format!("Processed after key len: {:?}", bytes.len()));
-
-            self.log_debug(format!("Processing value: {:?}", value));
-            for val in value {
-                bytes.push(val.clone());
-            }
-            self.log_debug(format!("Processed value: {:?}", value));
-            self.log_debug(format!("Processed after value len: {:?}", bytes.len()));
-        }
-
-        self.log_debug("HANDLING BYTE LINES: Finished processing byte lines.".to_owned());
-        self.log_debug(format!("SAVE BYTE LENGTH: {}", bytes.len()));
-
-        bytes
-    }
-
-    pub fn handle_read_lines(&mut self, lines: Vec<u8>) -> HashMap<[u8; 63], [u8; 64]> {
-        let mut map: HashMap<[u8; 63], [u8; 64]> = HashMap::new();
-
-        let mut key: Vec<u8> = vec![];
-        let mut value: Vec<u8> = vec![];
-        let mut is_key = true;
-        self.log_debug(format!("Amount of bytes found in handle_read_lines: {}", lines.len()));
-
-        self.log_debug("Starting to process lines...".to_owned());
-
-        for line in lines.iter() {
-
-            //self.log_debug(format!("Key Size: {}", key.clone().len()));
-            //self.log_debug(format!("Value Size: {}", value.clone().len()));
-
-            if key.len() == 63 {
-                if is_key {
-                    is_key = false;
-                    self.log_debug(format!("Switching to value"));
-                    self.log_debug(format!("Found key: {}", std::string::String::from_utf8(key.clone()).unwrap()));
-                };
-            } else {
-                if !is_key {
-                    is_key = true;
-                    self.log_debug(format!("Switching to key"));
-                };
-            };
-
-
-            match is_key {
-                true => { 
-                    key.push(*line);
-                },
-                false => { 
-                    value.push(*line);
-                },
-            };
-
-            if (key.len() == 63) && (value.len() == 64) {
-                self.log_debug("Appending key and value to map.".to_owned());
-
-                let mut key_b = [0u8; 63];
-                let mut value_b = [0u8; 64];
-                let key_len = 63;
-                let value_len = 64;
-
-                key_b.copy_from_slice(&key[..key_len]);
-                value_b.copy_from_slice(&value[..value_len]);
-
-                map.insert(key_b, value_b);
-                key.clear();
-                value.clear();
-                continue
-            };
-        };
-
-        if map.is_empty() {
-            self.log_debug("No data found!".to_owned());
-        } else {
-            self.log_debug(format!("Data found, size: {}", map.len()));
-        }
-
-        return map;
+    
+    #[test]
+    fn test_write_read_buffer() {
+        // Create a temp file
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+        
+        // Create test data
+        let data = b"Hello, world!".repeat(1000);
+        
+        // Write data
+        let bytes_written = write_buffer_to_file(path, &data).unwrap();
+        assert_eq!(bytes_written, data.len());
+        
+        // Read data back
+        let read_data = read_file_to_buffer(path).unwrap();
+        
+        // Verify
+        assert_eq!(read_data, data);
     }
 }
+
+

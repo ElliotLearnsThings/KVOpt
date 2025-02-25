@@ -1,192 +1,128 @@
-use core::time;
-use std::{collections::HashMap, io::{self, Read}, sync::{Arc, Condvar, Mutex, MutexGuard}, thread::{self}};
+use std::{io::{self, Read}, sync::{Arc, Mutex}, time::Duration};
+use chrono::Utc;
+use crate::{buffer::BufferAccess, Cache};
 
-use chrono::{TimeDelta, Utc};
+// Optimized input buffer size for better throughput
+const INPUT_BUFFER_SIZE: usize = 128 * 16; // 16 commands at once
+// How often to persist cache to disk (in seconds)
+const PERSISTENCE_INTERVAL_SECS: u64 = 60;
 
-use crate::{buffer::BufferAccess, logger::Logger, Cache};
-
-// run_tasks function
-pub fn run_tasks(cache: &Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Result<(), Box<dyn std::error::Error>> {
-
+// run_tasks function, optimized for throughput and efficiency
+pub fn run_tasks(cache: &Arc<Mutex<Cache>>) -> Result<(), Box<dyn std::error::Error>> {
+    // Log initial state
     {
-        let debug_cache = cache.clone();
-        let mut debug_cache = debug_cache.lock().unwrap();
-        let len: usize;
-        {
-            let kv =  &mut debug_cache.vals;
-            let kv = kv.lock().unwrap();
-            len = kv.len();
-        }
-        debug_cache.log_debug(format!("DEBUG RUN TASKS: KV Size found on load: {}", len));
+        let mut cache_lock = cache.lock().unwrap();
+        let kv_size = cache_lock.vals.read().unwrap().len();
+        cache_lock.log_debug(format!("Starting cache service with {} entries", kv_size));
     }
-
-    let cv = Arc::new((Mutex::new(false), Condvar::new()));
-    let cv_for_tasks = Arc::clone(&cv);
-    let cache_for_tasks = Arc::clone(cache);
-    // Clone cache for tasks_thread
-    //
     
-    let tasks_thread = thread::spawn(move || {
-        let (ref lock, ref cvar) = *cv_for_tasks;
+    // Create a background task for periodic persistence
+    let persistence_cache = Arc::clone(cache);
+    std::thread::spawn(move || {
         loop {
-            let mut started = cvar.wait_while(lock.lock().unwrap(), |started| !*started).unwrap();
-            let mut cache = cache_for_tasks.lock().expect("Unable to lock cache");
-
-
+            // Sleep for the persistence interval
+            std::thread::sleep(Duration::from_secs(PERSISTENCE_INTERVAL_SECS));
+            
+            // Check if we should exit
             {
-                let init_time = Utc::now();
-                cache.log_debug("RUNNING SAVE".to_string());
-                cache.handle_save();
-                let final_time = Utc::now();
-                let time_delta = final_time - init_time;
-                cache.log_debug(format!("FINISHED SAVE IN {} MILISECONDS", time_delta.num_milliseconds()));
+                let cache_lock = persistence_cache.lock().unwrap();
+                if cache_lock.should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
             }
-
-            *started = false;
+            
+            // Persist cache to disk
+            if let Ok(mut cache_lock) = persistence_cache.lock() {
+                let start_time = Utc::now();
+                cache_lock.log_debug("PERIODIC CACHE PERSISTENCE".to_string());
+                
+                if let Err(e) = cache_lock.clean_up() {
+                    eprintln!("Error during periodic persistence: {}", e);
+                }
+                
+                let end_time = Utc::now();
+                let duration = end_time - start_time;
+                cache_lock.log_debug(format!("Persistence completed in {} ms", duration.num_milliseconds()));
+            }
         }
     });
     
-    // Clone cache for buffer_thread
-    let cache_for_buffer = Arc::clone(&cache);
-    let cv_for_buffer = Arc::clone(&cv);
-
-    let mut duration = TimeDelta::zero();
-
-    let buffer_thread = thread::spawn(move || {
-
+    // Create a background task for periodic cache invalidation
+    let invalidation_cache = Arc::clone(cache);
+    std::thread::spawn(move || {
         loop {
-            if !duration.is_zero() {
-                //println!("diff: {}", duration);
+            // Run cache invalidation every 5 seconds
+            std::thread::sleep(Duration::from_secs(5));
+            
+            // Check if we should exit
+            {
+                let cache_lock = invalidation_cache.lock().unwrap();
+                if cache_lock.should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
             }
-            let stdin = io::stdin();
-            let mut handle = stdin.lock();
-            let mut buffer = [0u8; 128];
-            if let Ok(_) = handle.read(&mut buffer) {
-                let start_time = chrono::Utc::now();
-                let mut cache = cache_for_buffer.lock().expect("Could not lock buffer cache");
-                let _ = cache.handle_in(buffer);
-                let end_time = chrono::Utc::now();
-                duration = end_time - start_time;
-                
-                let (ref lock, ref cvar) = *cv_for_buffer;
-                let mut started = lock.lock().unwrap();
-                *started = true;
-                cvar.notify_one();
-            };
+            
+            // Invalidate expired cache entries
+            if let Ok(mut cache_lock) = invalidation_cache.lock() {
+                let _ = cache_lock.invalidate_cache();
+            }
         }
     });
-
-    // Join threads and propagate errors
-    tasks_thread.join().map_err(|_| "Tasks thread panicked")?;
-    buffer_thread.join().map_err(|_| "Buffer thread panicked")?;
-
+    
+    // Main processing loop - optimized for throughput
+    let stdin = io::stdin();
+    let mut handle = stdin.lock();
+    
+    // Pre-allocate buffer for batch processing
+    let mut buffer = vec![0u8; INPUT_BUFFER_SIZE];
+    let mut command_buffers = Vec::with_capacity(16);
+    
+    loop {
+        // Check if we should exit
+        {
+            let cache_lock = cache.lock().unwrap();
+            if cache_lock.should_exit.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+        }
+        
+        // Read a batch of commands
+        match handle.read(&mut buffer) {
+            Ok(bytes_read) if bytes_read > 0 => {
+                // Process in chunks of 128 bytes (command size)
+                command_buffers.clear();
+                
+                for chunk in buffer[..bytes_read].chunks_exact(128) {
+                    let mut cmd_buffer = [0u8; 128];
+                    cmd_buffer.copy_from_slice(chunk);
+                    command_buffers.push(cmd_buffer);
+                }
+                
+                if !command_buffers.is_empty() {
+                    // Process commands in batch when possible
+                    if command_buffers.len() > 1 {
+                        if let Ok(mut cache_lock) = cache.lock() {
+                            let _ = cache_lock.handle_batch(&command_buffers);
+                        }
+                    } else {
+                        // Process single command
+                        if let Ok(mut cache_lock) = cache.lock() {
+                            let _ = cache_lock.handle_in(command_buffers[0]);
+                        }
+                    }
+                }
+            },
+            Ok(_) => {
+                // Zero bytes read, pause briefly to avoid CPU spinning
+                std::thread::sleep(Duration::from_millis(10));
+            },
+            Err(e) => {
+                eprintln!("Error reading from stdin: {}", e);
+                break;
+            }
+        }
+    }
+    
     Ok(())
 }
 
-
-impl Cache {
-    pub fn invalidate_cache(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut logs: Vec<String> = Vec::new();
-        {
-            let mut keys_to_remove: Vec<[u8;63]> = Vec::new();
-
-            let mut kv = self.vals.lock().unwrap();
-
-            for val in kv.iter_mut() {
-                let mut should_remove = false;
-                let key = val.0;
-
-                // Create start time buffer
-                let mut start_time: [u8; 8] = [0u8; 8];
-                start_time[2..].copy_from_slice(&val.1[56..62]);
-
-                let start_time = i64::from_be_bytes(start_time);
-                //println!("Got start_time: {}", start_time.clone());
-
-                // Create expire time buffer
-                let mut expire_time = [0u8;2]; // 56-64 are time values
-                expire_time[..].clone_from_slice(&val.1[62..64]);
-
-                let expire_time = i16::from_be_bytes(expire_time);
-                //println!("Got expire_time: {}", expire_time.clone());
-
-                // start time is epoch timestamp in secs
-                // therefore start_time + hours is expire_time timestamp
-
-                let current_timestamp = chrono::Utc::now().timestamp();
-                let expire_timestamp = start_time + (expire_time as i64);
-
-                // If the expire is smaller than current
-                if (current_timestamp > expire_timestamp) && (expire_time != 0) {
-                    logs.push(format!("REMOVED KEY: {}, WITH expire_timestamp: {}, WITH current_timestamp: {}, WITH expire_time: {}", std::str::from_utf8(key).unwrap(), expire_timestamp, current_timestamp, expire_time));
-                    should_remove = true;
-                }
-
-                // If should remove save key to vec
-                if should_remove {
-                    keys_to_remove.push(*key);
-                }
-            }
-
-            // Remove collected items.
-            for item in keys_to_remove {
-                kv.remove(&item);
-            }
-        }
-
-        for log in logs {
-            self.log_debug(log);
-        }
-
-        Ok(())
-    }
-
-
-
-}
-
-#[cfg(test)]
-
-mod tests {
-    use super::*;
-
-    #[test] 
-    fn max_per_second_insert() {
-        let mut cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", crate::LogLevel::DEBUG);
-
-        let mut buffers: Vec<[u8; 128]> = vec![];
-
-        for _ in 0..1_000_000 {
-            let command = "I";
-            let iuuid = uuid::Uuid::new_v4().to_string();
-            let ibreak = "0".repeat(48);
-            let fuuid = uuid::Uuid::new_v4().to_string();
-            let fbreak = "0".repeat(40);
-            let mut tcurb = [0u8;6];
-            let tcur = chrono::Utc::now().timestamp().to_be_bytes();
-            tcurb[..].copy_from_slice(&tcur[2..]);
-            let tlen = (10 as i16).to_be_bytes();
-            
-            let mut tbuf = [0u8;8];
-            tbuf[..6].copy_from_slice(&tcurb);
-            tbuf[6..8].copy_from_slice(&tlen);
-
-            let tbufstr = std::str::from_utf8(&tbuf).unwrap();
-
-            let buffer = format!("{}{}{}{}{}{}", command, iuuid, ibreak, fuuid, fbreak, tbufstr);
-            let buffer = buffer.as_bytes();
-            let len = buffer.len().min(128);
-            let mut byte_array = [0u8;128];
-            byte_array[..len].copy_from_slice(&buffer[..len]);
-            buffers.push(byte_array);
-        }
-
-        let time_start = chrono::Utc::now();
-        for buffer in buffers.iter() {
-            let _ = cache.handle_in(*buffer);
-        }
-        let time_end = chrono::Utc::now();
-        let diff = time_end - time_start;
-        println!("Delta: {}", diff);
-    }
-}
