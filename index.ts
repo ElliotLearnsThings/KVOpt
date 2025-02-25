@@ -43,13 +43,22 @@ class CacheProcess {
     return final_b;
   }
 
-  private createCombinedBufferForGetAndRemove(key: string): Buffer {
+  private createCombinedBufferForGetAndRemove(
+    isGet: boolean,
+    key: string,
+  ): Buffer {
     if (this.level === "debug") {
       console.log("DEBUG: Getting value for key");
     }
 
-    const command = Buffer.from("G");
-    const keyBuffer = Buffer.alloc(127, key, "ascii");
+    let command = Buffer.from("");
+
+    if (isGet) {
+      command = Buffer.from("G");
+    } else {
+      command = Buffer.from("R");
+    }
+    const keyBuffer = Buffer.alloc(63, key, "ascii");
     return Buffer.concat([command, keyBuffer], 128);
   }
 
@@ -73,13 +82,8 @@ class CacheProcess {
   private handleProcessData(data: string) {
     // Get most recent resolve
     const resolve = this.resolveStack.shift();
-    if (resolve[0] !== "G") {
-      resolve[1](resolve[0]);
-      return;
-    } else {
-      resolve[1](data);
-      return;
-    }
+    resolve[1](data);
+    return;
   }
 
   constructor(rustProgramPath: string, level: "normal" | "debug") {
@@ -140,7 +144,7 @@ class CacheProcess {
       if (!this.process || !this.process.stdin) {
         return resolve("E");
       }
-      const buf = this.createCombinedBufferForGetAndRemove(key);
+      const buf = this.createCombinedBufferForGetAndRemove(true, key);
       this.process.stdin.write(buf);
       this.resolveStack.push(["G", resolve]);
     });
@@ -149,9 +153,9 @@ class CacheProcess {
   async remove(key: string): Promise<string> {
     return new Promise((resolve) => {
       if (!this.process || !this.process.stdin) {
-        resolve("E");
+        return resolve("E");
       }
-      const buf = this.createCombinedBufferForGetAndRemove(key);
+      const buf = this.createCombinedBufferForGetAndRemove(false, key);
       this.process.stdin.write(buf);
       this.resolveStack.push(["R", resolve]);
     });
