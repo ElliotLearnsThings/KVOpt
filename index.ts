@@ -529,8 +529,8 @@ class CacheProcess {
       });
 
       this.process.stdout?.removeAllListeners();
+      delete this.process;
       this.process = null;
-      return;
     } else if (this.process) {
       this.log("Closing cache with process.kill");
       this.process.kill();

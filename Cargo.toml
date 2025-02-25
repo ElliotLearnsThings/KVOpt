@@ -10,6 +10,12 @@ tempfile = "3.17.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 ctrlc = "3.4.5"
+hashbrown = "0.14.0"  # High-performance hashmap implementation
+dashmap = "5.5.3"     # Concurrent hashmap
+threadpool = "1.8.1"  # Thread pool for background tasks
+parking_lot = "0.12.0" # More efficient mutexes and rwlocks
+rayon = "1.8.0"        # Parallel programming primitives
+thiserror = "1.0.56"   # Better error handling
 
 [dependencies.uuid]
 version = "1.14.0"
@@ -18,3 +24,11 @@ features = [
     "fast-rng",          # Use a faster (but still sufficiently random) RNG
     "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
 ]
+
+[profile.release]
+opt-level = 3           # Maximum optimization
+lto = true              # Link-time optimization
+codegen-units = 1       # Optimize for size
+panic = "abort"         # Abort on panic for smaller code
+strip = true            # Strip symbols for smaller binary
+
