@@ -1,5 +1,6 @@
-use std::{collections::HashMap, io::{Read, Write}, path::{Path, PathBuf}, process::exit, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
+use std::{collections::HashMap, io::{Read, Write}, path::{Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}};
 
+use chrono::Utc;
 use logger::{Log, Logger};
 
 /*
@@ -22,59 +23,42 @@ pub mod buffer;
 pub mod tasks;
 pub mod utils;
 
+#[derive(Clone)]
+pub enum LogLevel {
+    NORMAL,
+    DEBUG,
+}
 
+#[derive(Clone)]
 pub struct Cache {
     cur_buf: Arc<Mutex<[u8; 128]>>, // Sync update e.g. 
     log_path: Arc<Mutex<PathBuf>>, // Async logging
     vals: Arc<Mutex<HashMap<[u8;63], [u8;64]>>>, // Async KV management
-    should_exit: Arc<Mutex<bool>> // Async KV management
-}
-
-impl Cache {
-    fn from_log_path(log_path: &str) -> Self {
-        let cur_buf = Arc::new(Mutex::new([0u8; 128]));
-        let path = Path::new(log_path);
-        let log_path = Arc::new(Mutex::new(path.to_path_buf()));
-        Cache {
-            cur_buf,
-            log_path,
-            vals: Arc::new(Mutex::new(HashMap::new())),
-            should_exit: Arc::new(Mutex::new(false)),
-        }
-    }
-    fn load(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Read from json in file to get cache state.
-        
-        let mut file = std::fs::File::open(std::env::current_dir()?.join("data/cache.json"))?;
-        let mut buf = vec![];
-        file.read(&mut buf)?;
-
-        // For every line in the file, add key then value
-        self.vals = Arc::from(Mutex::from(utils::handle_read_lines(buf)));
-        Ok(())
-    }
-    fn clean_up(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        
-        let _ = self.write_log("OPENING CACHE STORE".to_owned());
-        let kv = self.vals.lock().unwrap();
-
-        let write_bytes = utils::create_byte_lines(kv);
-
-        let mut file = std::fs::File::create(std::env::current_dir()?.join("data/cache.json"))?;
-        file.write(&write_bytes)?;
-
-        // save state to json in file (twice).
-        Ok(())
-    }
+    should_exit: Arc<Mutex<bool>>, // Async KV management
+    level: LogLevel,
 }
 
 fn handle_close (cache: Arc<Mutex<Cache>>) {
     println!("Received Ctrl+C (SIGINT)! Cleaning up...");
     let mut cache = cache.lock().unwrap();
+
+    {
+        let init_time = Utc::now();
+        match cache.invalidate_cache(){
+            Ok(_) => {
+                let final_time = Utc::now();
+                let time_delta = final_time - init_time;
+                cache.log_debug(format!("SUCCESS INVALIDATING ON SAVE, IN {}", time_delta));}
+            Err(e) => {cache.log_debug(format!("FAILED INVALIDATING ON SAVE, {}", e));}
+        };
+    }
+
+        
     cache.write_log(format!("ATTEMPTING EXIT AT: {}", chrono::Utc::now())).unwrap();
     cache.clean_up().expect("Unable to clean up cache");
     cache.write_log(format!("EXIT AT: {}", chrono::Utc::now())).unwrap();
 }
+
 
 #[cfg(windows)]
 fn main() {
@@ -88,11 +72,18 @@ fn main() {
         _ => panic!("Could not resolve log path!")
     };
 
-    let mut cache = Cache::from_log_path(&log_dir);
+    let init_time = chrono::Utc::now();
+    let mut cache = Cache::from_log_path(&log_dir, LogLevel::NORMAL);
     match cache.load() {
         Ok(_) => {},
         _ => {},
     };
+    cache.invalidate_cache().expect("LAUNCH ERROR, UNABLE TO VALIDATE CACHE");
+
+    let final_time = chrono::Utc::now();
+    let time_delta = final_time - init_time;
+
+    cache.log_debug(format!("START LOAD RAN, TOOK {} MILIES", time_delta.num_milliseconds()));
 
     let mut time = format!("START AT SYSTEMTIME: {}", Utc::now());
     let logger = Logger::from_log_path(log_dir, false);
@@ -106,13 +97,14 @@ fn main() {
 
     // Set up signal handler using ctrc crate
     ctrlc::set_handler(move || {
-        running_listener.store(false, Ordering::SeqCst);
         handle_close(cache_for_cleanup.clone());
+        running_listener.store(false, Ordering::SeqCst);
         std::process::exit(0);
     }).expect("Error setting Ctrl-C handler");
 
     // Main loop to run tasks
     while running.load(Ordering::SeqCst) {
+        println!("RUNNING");
         let _ = tasks::run_tasks(&cache, Arc::from(Mutex::from(logger.clone())));
     }
 }
@@ -161,6 +153,7 @@ fn main() {
     });
 
     while running.load(Ordering::SeqCst) {
+        println!("RUNNING");
         let _ = tasks::run_tasks(&cache, Arc::from(Mutex::from(logger.clone())));
     }
 

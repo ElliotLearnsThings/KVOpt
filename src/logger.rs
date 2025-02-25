@@ -58,32 +58,6 @@ where T: Display
     fn write_log(&mut self, input: T) -> Result<(), Box<dyn std::error::Error>>;
 }
 
-impl<T> Log<T> for Cache
-where
-    T: Display + fmt::Write + std::marker::Send + std::marker::Sync,
-{
-    // This will be on spawned thread
-    fn write_log(&mut self, input: T) -> Result<(), Box<dyn std::error::Error>> 
-        where T: std::fmt::Display + Send,
-    {
-
-        let input_clone = input.to_string();
-        let path_name = Arc::clone(&self.log_path);
-
-        let log_thread = std::thread::spawn({
-            move || {
-                let path = path_name.lock().unwrap();
-                let mut buf = std::fs::read(&*path).unwrap();
-                let log_entry = format!("\n\r[LOG]{}", input_clone);
-                buf.extend_from_slice(log_entry.as_bytes());
-                std::fs::write(&*path, &buf).unwrap();
-            }
-        });
-
-        log_thread.join().unwrap();
-        Ok(())
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -95,7 +69,7 @@ mod tests {
     fn setup_cache() -> (Cache, NamedTempFile) {
         let temp_file = NamedTempFile::new().expect("Failed to create temp file");
         let path = temp_file.path().to_str().unwrap().to_string();
-        let cache = Cache::from_log_path(&path);
+        let cache = Cache::from_log_path(&path, crate::LogLevel::DEBUG);
         (cache, temp_file)
     }
 

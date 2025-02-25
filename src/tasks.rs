@@ -1,42 +1,51 @@
 use core::time;
 use std::{collections::HashMap, io::{self, Read}, sync::{Arc, Condvar, Mutex, MutexGuard}, thread::{self}};
 
-use chrono::TimeDelta;
+use chrono::{TimeDelta, Utc};
 
 use crate::{buffer::BufferAccess, logger::Logger, Cache};
 
 // run_tasks function
 pub fn run_tasks(cache: &Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Result<(), Box<dyn std::error::Error>> {
 
+    {
+        let debug_cache = cache.clone();
+        let mut debug_cache = debug_cache.lock().unwrap();
+        let len: usize;
+        {
+            let kv =  &mut debug_cache.vals;
+            let kv = kv.lock().unwrap();
+            len = kv.len();
+        }
+        debug_cache.log_debug(format!("DEBUG RUN TASKS: KV Size found on load: {}", len));
+    }
+
     let cv = Arc::new((Mutex::new(false), Condvar::new()));
     let cv_for_tasks = Arc::clone(&cv);
     let cache_for_tasks = Arc::clone(cache);
     // Clone cache for tasks_thread
+    //
+    
     let tasks_thread = thread::spawn(move || {
-        //println!("Tasks thread started");
+        let (ref lock, ref cvar) = *cv_for_tasks;
         loop {
-            let cv_inner = Arc::clone(&cv_for_tasks);
-            let cache_for_tasks = Arc::clone(&cache_for_tasks);
-            let looped_thread = thread::spawn(move || {
-                let (ref lock, ref cvar) = *cv_inner;
-                let _started = cvar.wait_while(lock.lock().unwrap(), |started| !*started).unwrap();
-                let cache = cache_for_tasks.lock().expect("Unable to lock cache");
-                let kv = &cache.vals;
+            let mut started = cvar.wait_while(lock.lock().unwrap(), |started| !*started).unwrap();
+            let mut cache = cache_for_tasks.lock().expect("Unable to lock cache");
 
-                //println!("Ran thread tasks");
-                //if *cache.should_exit.lock().unwrap() {
-                    //exit(0);
-                //}
 
-                let kv_guard = kv.lock().expect("Unable to lock kv");
-                invalidate_cache(kv_guard).expect("unable to lock");
-                return;
-            });
-            let _ = looped_thread.join();
-            thread::sleep(time::Duration::from_secs_f32(10000.0));
+            {
+                let init_time = Utc::now();
+                cache.log_debug("RUNNING SAVE".to_string());
+                cache.handle_save();
+                let final_time = Utc::now();
+                let time_delta = final_time - init_time;
+                cache.log_debug(format!("FINISHED SAVE IN {} MILISECONDS", time_delta.num_milliseconds()));
+            }
+
+            *started = false;
         }
     });
-
+    
     // Clone cache for buffer_thread
     let cache_for_buffer = Arc::clone(&cache);
     let cv_for_buffer = Arc::clone(&cv);
@@ -75,50 +84,65 @@ pub fn run_tasks(cache: &Arc<Mutex<Cache>>, _logger: Arc<Mutex<Logger>>) -> Resu
 }
 
 
-fn invalidate_cache(mut kv: MutexGuard<HashMap<[u8; 63], [u8; 64]>>) -> Result<(), Box<dyn std::error::Error>> {
-    let mut keys_to_remove: Vec<[u8;63]> = Vec::new();
+impl Cache {
+    pub fn invalidate_cache(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut logs: Vec<String> = Vec::new();
+        {
+            let mut keys_to_remove: Vec<[u8;63]> = Vec::new();
 
-    for val in kv.iter_mut() {
-        let mut should_remove = false;
-        let key = val.0;
+            let mut kv = self.vals.lock().unwrap();
 
-        // Create start time buffer
-        let mut start_time: [u8; 8] = [0u8; 8];
-        start_time[2..].copy_from_slice(&val.1[56..62]);
+            for val in kv.iter_mut() {
+                let mut should_remove = false;
+                let key = val.0;
 
-        let start_time = i64::from_be_bytes(start_time);
-        //println!("Got start_time: {}", start_time.clone());
+                // Create start time buffer
+                let mut start_time: [u8; 8] = [0u8; 8];
+                start_time[2..].copy_from_slice(&val.1[56..62]);
 
-        // Create expire time buffer
-        let mut expire_time = [0u8;2]; // 56-64 are time values
-        expire_time[..].clone_from_slice(&val.1[62..64]);
+                let start_time = i64::from_be_bytes(start_time);
+                //println!("Got start_time: {}", start_time.clone());
 
-        let expire_time = i16::from_be_bytes(expire_time);
-        //println!("Got expire_time: {}", expire_time.clone());
+                // Create expire time buffer
+                let mut expire_time = [0u8;2]; // 56-64 are time values
+                expire_time[..].clone_from_slice(&val.1[62..64]);
 
-        // start time is epoch timestamp in secs
-        // therefore start_time + hours is expire_time timestamp
-        
-        let current_timestamp = chrono::Utc::now().timestamp();
-        let expire_timestamp = start_time + (expire_time as i64);
+                let expire_time = i16::from_be_bytes(expire_time);
+                //println!("Got expire_time: {}", expire_time.clone());
 
-        // If the expire is smaller than current
-        if current_timestamp > expire_timestamp {
-            should_remove = true;
+                // start time is epoch timestamp in secs
+                // therefore start_time + hours is expire_time timestamp
+
+                let current_timestamp = chrono::Utc::now().timestamp();
+                let expire_timestamp = start_time + (expire_time as i64);
+
+                // If the expire is smaller than current
+                if (current_timestamp > expire_timestamp) && (expire_time != 0) {
+                    logs.push(format!("REMOVED KEY: {}, WITH expire_timestamp: {}, WITH current_timestamp: {}, WITH expire_time: {}", std::str::from_utf8(key).unwrap(), expire_timestamp, current_timestamp, expire_time));
+                    should_remove = true;
+                }
+
+                // If should remove save key to vec
+                if should_remove {
+                    keys_to_remove.push(*key);
+                }
+            }
+
+            // Remove collected items.
+            for item in keys_to_remove {
+                kv.remove(&item);
+            }
         }
 
-        // If should remove save key to vec
-        if should_remove {
-            keys_to_remove.push(*key);
+        for log in logs {
+            self.log_debug(log);
         }
+
+        Ok(())
     }
 
-    // Remove collected items.
-    for item in keys_to_remove {
-        kv.remove(&item);
-    }
 
-    Ok(())
+
 }
 
 #[cfg(test)]
@@ -128,7 +152,7 @@ mod tests {
 
     #[test] 
     fn max_per_second_insert() {
-        let mut cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log");
+        let mut cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", crate::LogLevel::DEBUG);
 
         let mut buffers: Vec<[u8; 128]> = vec![];
 
@@ -166,4 +190,3 @@ mod tests {
         println!("Delta: {}", diff);
     }
 }
-

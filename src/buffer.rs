@@ -1,5 +1,7 @@
 use std::{io::{self, Read, Write}, sync::Arc};
 
+use chrono::Utc;
+
 use crate::Cache;
 
 pub trait BufferAccess<'a> {
@@ -19,6 +21,15 @@ impl<'a> BufferAccess<'a> for Cache {
         //let input = self._read().map_err(|_| "Failed reading")?;
 
         // Clone vals for thread-safe access
+        self.log_debug("RUNNING INVALIDATE".to_string());
+        let init_time = Utc::now();
+
+        {
+            let _ = self.invalidate_cache().expect("unable to invalidate");
+            let final_time = Utc::now();
+            let time_delta = final_time - init_time;
+            self.log_debug(format!("FINISHED INVALIDATE IN {} MILISECONDS", time_delta.num_milliseconds()));
+        }
         let vals = Arc::clone(&self.vals);
         //let should_exit = Arc::clone(&self.should_exit);
         let command = input[0];
@@ -54,6 +65,7 @@ impl<'a> BufferAccess<'a> for Cache {
             
             b'I' => {
                 let mut kv = vals.lock().expect("Unable to lock KV in thread");
+                self.log_debug(format!("ADDING KV"));
                 let _ = kv.insert(key, value);
                 let stdout = io::stdout();
                 let mut handle = stdout.lock();
@@ -81,7 +93,7 @@ mod tests {
 
     // Helper to create a Cache with a pre-filled buffer
     fn setup_cache_with_buffer(buffer: [u8; 128]) -> Cache {
-        let cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log");
+        let cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", crate::LogLevel::DEBUG);
         let buf = Arc::clone(&cache.cur_buf);
         let mut buf = buf.lock().unwrap();
         *buf = buffer;
@@ -107,7 +119,7 @@ mod tests {
         full_value[0..60].copy_from_slice(&value);
         full_value[60..64].copy_from_slice(expiration);
 
-        let cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log");
+        let cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", crate::LogLevel::DEBUG);
         cache.vals.lock().unwrap().insert(key, full_value);
 
         let buf = create_test_buffer(b'G', &key, &value, expiration);
@@ -129,7 +141,7 @@ mod tests {
         full_value[0..60].copy_from_slice(&value);
         full_value[60..64].copy_from_slice(expiration);
 
-        let cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log");
+        let cache = Cache::from_log_path("/Users/elliothegraeus/Documents/BASE/projects/cacherebook/log/log.log", crate::LogLevel::DEBUG);
         cache.vals.lock().unwrap().insert(key, full_value);
 
         let buf = create_test_buffer(b'R', &key, &value, expiration);
